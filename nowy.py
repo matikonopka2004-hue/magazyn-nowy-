@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import altair as alt  # <--- NOWOŚĆ: Biblioteka do kolorowych wykresów
 from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, Text
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 from datetime import datetime
@@ -17,6 +16,7 @@ class Kategoria(Base):
     id = Column(Integer, primary_key=True)
     nazwa = Column(String, nullable=False)
     opis = Column(Text)
+    # Relacje
     produkty = relationship("Produkt", back_populates="kategoria_rel", cascade="all, delete-orphan")
 
 class Produkt(Base):
@@ -30,7 +30,7 @@ class Produkt(Base):
     kategoria_rel = relationship("Kategoria", back_populates="produkty")
 
 # Baza danych
-DATABASE_URL = "sqlite:///magazyn_fixed.db"
+DATABASE_URL = "sqlite:///magazyn_fixed.db" # Zmieniłem nazwę, żeby wymusić czysty start
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
@@ -86,42 +86,35 @@ def sprzedaj_produkt(id_prod):
         else:
             return False, "Błąd produktu", None
 
-def zdejmij_stan(id_prod, ilosc_do_usuniecia):
-    with get_session() as session:
-        prod = session.query(Produkt).filter_by(id=id_prod).first()
-        if not prod:
-            return False, "Produkt nie istnieje."
-        
-        if ilosc_do_usuniecia <= 0:
-            return False, "Ilość musi być większa od 0."
-            
-        if prod.liczba < ilosc_do_usuniecia:
-            return False, f"⛔ Za mało towaru! Masz tylko {prod.liczba} szt."
-        
-        prod.liczba -= ilosc_do_usuniecia
-        session.commit()
-        return True, f"📉 Zdjęto {ilosc_do_usuniecia} szt. ze stanu."
-
 def usun_produkt_calowicie(id_prod):
     with get_session() as session:
         prod = session.query(Produkt).filter_by(id=id_prod).first()
         if prod:
             wartosc = prod.liczba * prod.cena
             nazwa = prod.nazwa
+            ilosc = prod.liczba
             session.delete(prod)
             session.commit()
-            return f"Usunięto kartotekę: {nazwa} (Strata: {wartosc:.2f} PLN)"
+            return f"Usunięto: {nazwa} (Strata: {wartosc:.2f} PLN)"
     return None
 
-# --- 4. BEZPIECZNE POBIERANIE DANYCH ---
+# --- 4. BEZPIECZNE POBIERANIE DANYCH (SAFE LOADING) ---
+# To jest kluczowa poprawka. Pobieramy dane i od razu zamykamy sesję,
+# przekazując do UI czyste słowniki (dictionaries), a nie obiekty bazy.
+
 safe_products = []
-safe_categories = {} 
+safe_categories = {} # Słownik id -> nazwa
 
 with get_session() as session:
+    # Pobierz wszystko
     kats = session.query(Kategoria).all()
     prods = session.query(Produkt).all()
+    
+    # Mapuj kategorie do słownika
     for k in kats:
         safe_categories[k.id] = k.nazwa
+        
+    # Mapuj produkty do listy słowników
     for p in prods:
         safe_products.append({
             "id": p.id,
@@ -134,65 +127,52 @@ with get_session() as session:
             "zdjecie_url": p.zdjecie_url
         })
 
-# --- 5. UI (DASHBOARD Z KOLOROWYMI WYKRESAMI) ---
+# --- 5. UI (DASHBOARD) ---
+
 st.title("📊 Centrum Magazynowe")
 
+# Sprawdzamy czy są jakiekolwiek produkty w bezpiecznej liście
 if safe_products:
+    # Tworzymy DataFrame z bezpiecznych danych
     df = pd.DataFrame(safe_products)
-    
-    # Metryki
+
+    # METRYKI
     m1, m2, m3 = st.columns(3)
     m1.metric("Wartość magazynu", f"{df['wartosc'].sum():.2f} PLN")
     m2.metric("Liczba produktów (SKU)", len(df))
     m3.metric("Łącznie sztuk", df['liczba'].sum())
-    
+
     st.divider()
-    
-    # Kolumny na wykresy
-    c1, c2 = st.columns(2)
-    
-    # WYKRES 1: Ilość (Kolorowanie po nazwie produktu)
-    with c1:
-        st.subheader("Stany Magazynowe")
-        chart_qty = alt.Chart(df).mark_bar().encode(
-            x=alt.X('nazwa', title='Produkt', sort=None),
-            y=alt.Y('liczba', title='Ilość sztuk'),
-            color=alt.Color('nazwa', legend=None), # Tu jest magia kolorów (legend=None ukrywa legendę bo nazwy są pod słupkami)
-            tooltip=['nazwa', 'liczba', 'kategoria_nazwa'] # To pokaże dymek po najechaniu
-        ).interactive()
-        st.altair_chart(chart_qty, use_container_width=True)
 
-    # WYKRES 2: Wartość w kategoriach (Kolorowanie po kategorii)
-    with c2:
+    # WYKRESY
+    c_chart1, c_chart2 = st.columns(2)
+    with c_chart1:
+        st.subheader("Stany (Ilość)")
+        st.bar_chart(df.set_index("nazwa")["liczba"], color="#4CAF50")
+    
+    with c_chart2:
         st.subheader("Wartość w kategoriach")
-        # Grupujemy dane
-        df_cat = df.groupby("kategoria_nazwa")["wartosc"].sum().reset_index()
-        
-        chart_val = alt.Chart(df_cat).mark_bar().encode(
-            x=alt.X('kategoria_nazwa', title='Kategoria'),
-            y=alt.Y('wartosc', title='Wartość (PLN)'),
-            color=alt.Color('kategoria_nazwa', scale=alt.Scale(scheme='spectral')), # Schemat kolorów 'spectral'
-            tooltip=['kategoria_nazwa', 'wartosc']
-        ).interactive()
-        st.altair_chart(chart_val, use_container_width=True)
-
+        # Grupujemy po nazwie kategorii
+        if "kategoria_nazwa" in df.columns:
+            st.bar_chart(df.groupby("kategoria_nazwa")["wartosc"].sum(), color="#FF9800")
 else:
-    st.info("👋 Magazyn pusty. Dodaj produkty.")
+    st.info("👋 Witaj! Magazyn jest pusty. Dodaj pierwsze produkty w zakładce 'Dodawanie'.")
 
 st.divider()
 
 # --- 6. ZAKŁADKI ---
-tab1, tab2 = st.tabs(["🛒 Lista i Operacje", "➕ Dodawanie i Edycja"])
+tab1, tab2 = st.tabs(["🛒 Lista i Sprzedaż", "➕ Dodawanie i Edycja"])
 
-# ZAKŁADKA 1: LISTA I OPERACJE
+# ZAKŁADKA 1: SPRZEDAŻ
 with tab1:
-    st.header("Zarządzanie Stanem")
+    st.header("Terminal Sprzedażowy")
     
     col_filt, _ = st.columns([2,3])
     alarm_mode = col_filt.checkbox("Tylko stany alarmowe (< 5 szt.)")
 
     if safe_products:
         for p in safe_products:
+            # Filtrowanie
             if alarm_mode and p['liczba'] >= 5:
                 continue
 
@@ -208,40 +188,26 @@ with tab1:
                 # Dane
                 c2.subheader(p['nazwa'])
                 kolor = "red" if p['liczba'] < 5 else "green"
-                c2.caption(f"Kategoria: {p['kategoria_nazwa']}")
+                c2.markdown(f"Kategoria: **{p['kategoria_nazwa']}**")
                 c2.markdown(f"Stan: :{kolor}[**{p['liczba']}**] | Cena: **{p['cena']:.2f} PLN**")
                 
-                # Przycisk SPRZEDAJ
-                if c3.button("💰 Sprzedaj (1)", key=f"sell_{p['id']}", use_container_width=True):
+                # Akcje - Używamy ID ze słownika
+                if c3.button("💰 Sprzedaj", key=f"sell_{p['id']}", use_container_width=True):
                     ok, msg, kwit = sprzedaj_produkt(p['id'])
                     if ok:
                         st.toast(msg, icon="✅")
-                        st.success(f"🧾 {kwit['produkt']} - {kwit['cena']} PLN")
-                        time.sleep(1)
+                        st.success(f"🧾 PARAGON: {kwit['produkt']} - {kwit['cena']} PLN ({kwit['data']})")
+                        time.sleep(1.5)
                         st.rerun()
                     else:
                         st.error(msg)
-
-                # Przycisk USUŃ BAZĘ
-                if c4.button("❌ Usuń bazę", key=f"del_all_{p['id']}", type="primary", use_container_width=True):
-                    raport = usun_produkt_calowicie(p['id'])
-                    st.warning(raport)
-                    time.sleep(2)
-                    st.rerun()
                 
-                # SEKCJA KOREKTY
-                with st.expander(f"📉 Korekta ilości / Masowe usuwanie dla '{p['nazwa']}'"):
-                    ec1, ec2 = st.columns([2, 1])
-                    qty_to_remove = ec1.number_input("Ile sztuk odjąć?", min_value=1, max_value=p['liczba'], step=1, key=f"qty_input_{p['id']}")
-                    
-                    if ec2.button("Zdejmij ze stanu", key=f"btn_remove_qty_{p['id']}"):
-                        ok, msg = zdejmij_stan(p['id'], qty_to_remove)
-                        if ok:
-                            st.success(msg)
-                            time.sleep(1)
-                            st.rerun()
-                        else:
-                            st.error(msg)
+                if c4.button("❌ Usuń", key=f"del_{p['id']}", type="primary", use_container_width=True):
+                    raport = usun_produkt_calowicie(p['id'])
+                    if raport:
+                        st.warning(raport)
+                        time.sleep(2)
+                        st.rerun()
     else:
         st.write("Brak produktów.")
 
@@ -259,7 +225,8 @@ with tab2:
                     dodaj_kategorie(n_kat, d_kat)
                     st.success("Dodano!")
                     st.rerun()
-                else: st.error("Podaj nazwę.")
+                else:
+                    st.error("Podaj nazwę.")
         
         st.write("Twoje kategorie:")
         for kid, kname in safe_categories.items():
@@ -279,8 +246,11 @@ with tab2:
                 n_prod = st.text_input("Nazwa")
                 n_ilosc = st.number_input("Ilość", min_value=0, step=1)
                 n_cena = st.number_input("Cena", min_value=0.01, step=0.01)
+                
+                # Odwrócenie słownika nazwa -> id
                 mapa_nazw = {v: k for k, v in safe_categories.items()}
                 wybor_kat = st.selectbox("Kategoria", list(mapa_nazw.keys()))
+                
                 n_url = st.text_input("Zdjęcie URL (opcjonalnie)")
                 
                 if st.form_submit_button("Dodaj Produkt"):
@@ -288,4 +258,5 @@ with tab2:
                         dodaj_produkt(n_prod, n_ilosc, n_cena, mapa_nazw[wybor_kat], n_url)
                         st.success("Dodano produkt!")
                         st.rerun()
-                    else: st.error("Podaj nazwę!")
+                    else:
+                        st.error("Podaj nazwę!")
